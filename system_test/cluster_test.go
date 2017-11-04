@@ -47,7 +47,6 @@ func Test_MultiNodeCluster(t *testing.T) {
 	if err := node3.Join(leader); err != nil {
 		t.Fatalf("node failed to join leader: %s", err.Error())
 	}
-	node3.WaitForLeader()
 	_, err = node3.WaitForLeader()
 	if err != nil {
 		t.Fatalf("failed waiting for leader: %s", err.Error())
@@ -107,7 +106,7 @@ func Test_MultiNodeCluster(t *testing.T) {
 		t.Fatalf("failed to find new cluster leader after killing leader: %s", err.Error())
 	}
 
-	// Run queries against 2-node cluster.
+	// Run queries against the now 2-node cluster.
 	tests = []struct {
 		stmt     string
 		expected string

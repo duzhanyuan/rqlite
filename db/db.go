@@ -4,8 +4,10 @@ package db
 
 import (
 	"database/sql/driver"
+	"expvar"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/mattn/go-sqlite3"
@@ -13,11 +15,33 @@ import (
 
 const bkDelay = 250
 
+const (
+	fkChecks         = "PRAGMA foreign_keys"
+	fkChecksEnabled  = "PRAGMA foreign_keys=ON"
+	fkChecksDisabled = "PRAGMA foreign_keys=OFF"
+
+	numExecutions      = "executions"
+	numExecutionErrors = "execution_errors"
+	numQueries         = "queries"
+	numETx             = "execute_transactions"
+	numQTx             = "query_transactions"
+)
+
 // DBVersion is the SQLite version.
 var DBVersion string
 
+// stats captures stats for the DB layer.
+var stats *expvar.Map
+
 func init() {
 	DBVersion, _, _ = sqlite3.Version()
+	stats = expvar.NewMap("db")
+	stats.Add(numExecutions, 0)
+	stats.Add(numExecutionErrors, 0)
+	stats.Add(numQueries, 0)
+	stats.Add(numETx, 0)
+	stats.Add(numQTx, 0)
+
 }
 
 // DB is the SQL database.
@@ -123,8 +147,43 @@ func open(dbPath string) (*DB, error) {
 	}, nil
 }
 
+// EnableFKConstraints allows control of foreign key constraint checks.
+func (db *DB) EnableFKConstraints(e bool) error {
+	q := fkChecksEnabled
+	if !e {
+		q = fkChecksDisabled
+	}
+	_, err := db.sqlite3conn.Exec(q, nil)
+	return err
+}
+
+// FKConstraints returns whether FK constraints are set or not.
+func (db *DB) FKConstraints() (bool, error) {
+	r, err := db.sqlite3conn.Query(fkChecks, nil)
+	if err != nil {
+		return false, err
+	}
+
+	dest := make([]driver.Value, len(r.Columns()))
+	types := r.(*sqlite3.SQLiteRows).DeclTypes()
+	if err := r.Next(dest); err != nil {
+		return false, err
+	}
+
+	values := normalizeRowValues(dest, types)
+	if values[0] == int64(1) {
+		return true, nil
+	}
+	return false, nil
+}
+
 // Execute executes queries that modify the database.
 func (db *DB) Execute(queries []string, tx, xTime bool) ([]*Result, error) {
+	stats.Add(numExecutions, int64(len(queries)))
+	if tx {
+		stats.Add(numETx, 1)
+	}
+
 	type Execer interface {
 		Exec(query string, args []driver.Value) (driver.Result, error)
 	}
@@ -150,6 +209,8 @@ func (db *DB) Execute(queries []string, tx, xTime bool) ([]*Result, error) {
 		// handleError sets the error field on the given result. It returns
 		// whether the caller should continue processing or break.
 		handleError := func(result *Result, err error) bool {
+			stats.Add(numExecutionErrors, 1)
+
 			result.Error = err.Error()
 			allResults = append(allResults, result)
 			if tx {
@@ -186,6 +247,9 @@ func (db *DB) Execute(queries []string, tx, xTime bool) ([]*Result, error) {
 				}
 				break
 			}
+			if r == nil {
+				continue
+			}
 
 			lid, err := r.LastInsertId()
 			if err != nil {
@@ -218,6 +282,11 @@ func (db *DB) Execute(queries []string, tx, xTime bool) ([]*Result, error) {
 
 // Query executes queries that return rows, but don't modify the database.
 func (db *DB) Query(queries []string, tx, xTime bool) ([]*Rows, error) {
+	stats.Add(numQueries, int64(len(queries)))
+	if tx {
+		stats.Add(numQTx, 1)
+	}
+
 	type Queryer interface {
 		Query(query string, args []driver.Value) (driver.Rows, error)
 	}
@@ -262,7 +331,7 @@ func (db *DB) Query(queries []string, tx, xTime bool) ([]*Rows, error) {
 				allRows = append(allRows, rows)
 				continue
 			}
-			defer rs.Close() // This adds to all defers, right? Nothing leaks? XXX Could consume memory. Perhaps anon would be best.
+			defer rs.Close()
 			columns := rs.Columns()
 
 			rows.Columns = columns
@@ -270,29 +339,14 @@ func (db *DB) Query(queries []string, tx, xTime bool) ([]*Rows, error) {
 			dest := make([]driver.Value, len(rows.Columns))
 			for {
 				err := rs.Next(dest)
-
 				if err != nil {
 					if err != io.EOF {
 						rows.Error = err.Error()
 					}
 					break
 				}
-				values := make([]interface{}, len(rows.Columns))
-				// Text values come over (from sqlite-go) as []byte instead of strings
-				// for some reason, so we have explicitly convert (but only when type
-				// is "text" so we don't affect BLOB types)
-				for i, v := range dest {
-					if rows.Types[i] == "text" {
-						switch val := v.(type) {
-						case []byte:
-							values[i] = string(val)
-						default:
-							values[i] = val
-						}
-					} else {
-						values[i] = v
-					}
-				}
+
+				values := normalizeRowValues(dest, rows.Types)
 				rows.Values = append(rows.Values, values)
 			}
 			if xTime {
@@ -339,6 +393,40 @@ func (db *DB) Backup(path string) error {
 	}
 
 	return nil
+}
+
+// normalizeRowValues performs some normalization of values in the returned rows.
+// Text values come over (from sqlite-go) as []byte instead of strings
+// for some reason, so we have explicitly convert (but only when type
+// is "text" so we don't affect BLOB types)
+func normalizeRowValues(row []driver.Value, types []string) []interface{} {
+	values := make([]interface{}, len(types))
+	for i, v := range row {
+		if isTextType(types[i]) {
+			switch val := v.(type) {
+			case []byte:
+				values[i] = string(val)
+			default:
+				values[i] = val
+			}
+		} else {
+			values[i] = v
+		}
+	}
+	return values
+}
+
+// isTextType returns whether the given type has a SQLite text affinity.
+// http://www.sqlite.org/datatype3.html
+func isTextType(t string) bool {
+	return t == "text" ||
+		t == "" ||
+		strings.HasPrefix(t, "varchar") ||
+		strings.HasPrefix(t, "varying character") ||
+		strings.HasPrefix(t, "nchar") ||
+		strings.HasPrefix(t, "native character") ||
+		strings.HasPrefix(t, "nvarchar") ||
+		strings.HasPrefix(t, "clob")
 }
 
 // fqdsn returns the fully-qualified datasource name.

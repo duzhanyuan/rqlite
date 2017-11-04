@@ -27,15 +27,37 @@ var (
 	// ErrNotLeader is returned when a node attempts to execute a leader-only
 	// operation.
 	ErrNotLeader = errors.New("not leader")
+
+	// ErrOpenTimeout is returned when the Store does not apply its initial
+	// logs within the specified time.
+	ErrOpenTimeout = errors.New("timeout waiting for initial logs application")
 )
 
 const (
 	retainSnapshotCount = 2
-	raftTimeout         = 10 * time.Second
+	applyTimeout        = 10 * time.Second
+	openTimeout         = 120 * time.Second
 	sqliteFile          = "db.sqlite"
 	leaderWaitDelay     = 100 * time.Millisecond
 	appliedWaitDelay    = 100 * time.Millisecond
 )
+
+// QueryRequest represents a query that returns rows, and does not modify
+// the database.
+type QueryRequest struct {
+	Queries []string
+	Timings bool
+	Tx      bool
+	Lvl     ConsistencyLevel
+}
+
+// ExecuteRequest represents a query that returns now rows, but does modify
+// the database.
+type ExecuteRequest struct {
+	Queries []string
+	Timings bool
+	Tx      bool
+}
 
 // Transport is the interface the network service must provide.
 type Transport interface {
@@ -163,17 +185,39 @@ type Store struct {
 	meta   *clusterMeta
 
 	logger *log.Logger
+
+	SnapshotThreshold uint64
+	HeartbeatTimeout  time.Duration
+	ApplyTimeout      time.Duration
+	OpenTimeout       time.Duration
+}
+
+// StoreConfig represents the configuration of the underlying Store.
+type StoreConfig struct {
+	DBConf    *DBConfig      // The DBConfig object for this Store.
+	Dir       string         // The working directory for raft.
+	Tn        Transport      // The underlying Transport for raft.
+	Logger    *log.Logger    // The logger to use to log stuff.
+	PeerStore raft.PeerStore // The PeerStore to use for raft.
 }
 
 // New returns a new Store.
-func New(dbConf *DBConfig, dir string, tn Transport) *Store {
+func New(c *StoreConfig) *Store {
+	logger := c.Logger
+	if logger == nil {
+		logger = log.New(os.Stderr, "[store] ", log.LstdFlags)
+	}
+
 	return &Store{
-		raftDir:       dir,
-		raftTransport: tn,
-		dbConf:        dbConf,
-		dbPath:        filepath.Join(dir, sqliteFile),
+		raftDir:       c.Dir,
+		raftTransport: c.Tn,
+		dbConf:        c.DBConf,
+		dbPath:        filepath.Join(c.Dir, sqliteFile),
 		meta:          newClusterMeta(),
-		logger:        log.New(os.Stderr, "[store] ", log.LstdFlags),
+		logger:        logger,
+		peerStore:     c.PeerStore,
+		ApplyTimeout:  applyTimeout,
+		OpenTimeout:   openTimeout,
 	}
 }
 
@@ -184,33 +228,25 @@ func (s *Store) Open(enableSingle bool) error {
 		return err
 	}
 
-	// Create the database. Unless it's a memory-based database, it must be deleted
-	var db *sql.DB
-	var err error
-	if !s.dbConf.Memory {
-		// as it will be rebuilt from (possibly) a snapshot and committed log entries.
-		if err := os.Remove(s.dbPath); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		db, err = sql.OpenWithDSN(s.dbPath, s.dbConf.DSN)
-		if err != nil {
-			return err
-		}
-		s.logger.Println("SQLite database opened at", s.dbPath)
-	} else {
-		db, err = sql.OpenInMemoryWithDSN(s.dbConf.DSN)
-		if err != nil {
-			return err
-		}
-		s.logger.Println("SQLite in-memory database opened")
+	db, err := s.open()
+	if err != nil {
+		return err
 	}
 	s.db = db
 
-	// Setup Raft configuration.
-	config := raft.DefaultConfig()
+	// Setup Raft communication.
+	transport := raft.NewNetworkTransport(s.raftTransport, 3, 10*time.Second, os.Stderr)
+
+	// Create peer storage if necesssary.
+	if s.peerStore == nil {
+		s.peerStore = raft.NewJSONPeers(s.raftDir, transport)
+	}
+
+	// Get the Raft configuration for this store.
+	config := s.raftConfig()
 
 	// Check for any existing peers.
-	peers, err := readPeersJSON(filepath.Join(s.raftDir, "peers.json"))
+	peers, err := s.peerStore.Peers()
 	if err != nil {
 		return err
 	}
@@ -223,12 +259,6 @@ func (s *Store) Open(enableSingle bool) error {
 		config.EnableSingleNode = true
 		config.DisableBootstrapAfterElect = false
 	}
-
-	// Setup Raft communication.
-	transport := raft.NewNetworkTransport(s.raftTransport, 3, 10*time.Second, os.Stderr)
-
-	// Create peer storage.
-	s.peerStore = raft.NewJSONPeers(s.raftDir, transport)
 
 	// Create the snapshot store. This allows Raft to truncate the log.
 	snapshots, err := raft.NewFileSnapshotStore(s.raftDir, retainSnapshotCount, os.Stderr)
@@ -248,6 +278,16 @@ func (s *Store) Open(enableSingle bool) error {
 		return fmt.Errorf("new raft: %s", err)
 	}
 	s.raft = ra
+
+	if s.OpenTimeout != 0 {
+		// Wait until the initial logs are applied.
+		s.logger.Printf("waiting for up to %s for application of initial logs", s.OpenTimeout)
+		if err := s.WaitForAppliedIndex(s.raft.LastIndex(), s.OpenTimeout); err != nil {
+			return ErrOpenTimeout
+		}
+	} else {
+		s.logger.Println("not waiting for application of initial logs")
+	}
 
 	return nil
 }
@@ -374,9 +414,15 @@ func (s *Store) WaitForAppliedIndex(idx uint64, timeout time.Duration) error {
 
 // Stats returns stats for the store.
 func (s *Store) Stats() (map[string]interface{}, error) {
+	fkEnabled, err := s.db.FKConstraints()
+	if err != nil {
+		return nil, err
+	}
+
 	dbStatus := map[string]interface{}{
-		"dns":     s.dbConf.DSN,
-		"version": sql.DBVersion,
+		"dns":            s.dbConf.DSN,
+		"fk_constraints": enabledFromBool(fkEnabled),
+		"version":        sql.DBVersion,
 	}
 	if !s.dbConf.Memory {
 		dbStatus["path"] = s.dbPath
@@ -396,27 +442,32 @@ func (s *Store) Stats() (map[string]interface{}, error) {
 		return nil, err
 	}
 	status := map[string]interface{}{
-		"raft":    s.raft.Stats(),
-		"addr":    s.Addr().String(),
-		"leader":  s.Leader(),
-		"meta":    s.meta,
-		"peers":   peers,
-		"dir":     s.raftDir,
-		"sqlite3": dbStatus,
+		"raft":               s.raft.Stats(),
+		"addr":               s.Addr().String(),
+		"leader":             s.Leader(),
+		"apply_timeout":      s.ApplyTimeout.String(),
+		"open_timeout":       s.OpenTimeout.String(),
+		"heartbeat_timeout":  s.HeartbeatTimeout.String(),
+		"snapshot_threshold": s.SnapshotThreshold,
+		"meta":               s.meta,
+		"peers":              peers,
+		"dir":                s.raftDir,
+		"sqlite3":            dbStatus,
+		"db_conf":            s.dbConf,
 	}
 	return status, nil
 }
 
 // Execute executes queries that return no rows, but do modify the database.
-func (s *Store) Execute(queries []string, timings, tx bool) ([]*sql.Result, error) {
+func (s *Store) Execute(ex *ExecuteRequest) ([]*sql.Result, error) {
 	if s.raft.State() != raft.Leader {
 		return nil, ErrNotLeader
 	}
 
 	d := &databaseSub{
-		Tx:      tx,
-		Queries: queries,
-		Timings: timings,
+		Tx:      ex.Tx,
+		Queries: ex.Queries,
+		Timings: ex.Timings,
 	}
 	c, err := newCommand(execute, d)
 	if err != nil {
@@ -427,7 +478,7 @@ func (s *Store) Execute(queries []string, timings, tx bool) ([]*sql.Result, erro
 		return nil, err
 	}
 
-	f := s.raft.Apply(b, raftTimeout)
+	f := s.raft.Apply(b, s.ApplyTimeout)
 	if e := f.(raft.Future); e.Error() != nil {
 		if e.Error() == raft.ErrNotLeader {
 			return nil, ErrNotLeader
@@ -439,13 +490,17 @@ func (s *Store) Execute(queries []string, timings, tx bool) ([]*sql.Result, erro
 	return r.results, r.error
 }
 
-// Backup return a consistent snapshot of the underlying database.
+// Backup return a snapshot of the underlying database.
+//
+// If leader is true, this operation is performed with a read consistency
+// level equivalent to "weak". Otherwise no guarantees are made about the
+// read consistency level.
 func (s *Store) Backup(leader bool) ([]byte, error) {
 	if leader && s.raft.State() != raft.Leader {
-		return nil, fmt.Errorf("not leader")
+		return nil, ErrNotLeader
 	}
 
-	f, err := ioutil.TempFile("", "rqlilte-bak-")
+	f, err := ioutil.TempFile("", "rqlite-bak-")
 	if err != nil {
 		return nil, err
 	}
@@ -464,16 +519,16 @@ func (s *Store) Backup(leader bool) ([]byte, error) {
 }
 
 // Query executes queries that return rows, and do not modify the database.
-func (s *Store) Query(queries []string, timings, tx bool, lvl ConsistencyLevel) ([]*sql.Rows, error) {
+func (s *Store) Query(qr *QueryRequest) ([]*sql.Rows, error) {
 	// Allow concurrent queries.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if lvl == Strong {
+	if qr.Lvl == Strong {
 		d := &databaseSub{
-			Tx:      tx,
-			Queries: queries,
-			Timings: timings,
+			Tx:      qr.Tx,
+			Queries: qr.Queries,
+			Timings: qr.Timings,
 		}
 		c, err := newCommand(query, d)
 		if err != nil {
@@ -484,7 +539,7 @@ func (s *Store) Query(queries []string, timings, tx bool, lvl ConsistencyLevel) 
 			return nil, err
 		}
 
-		f := s.raft.Apply(b, raftTimeout)
+		f := s.raft.Apply(b, s.ApplyTimeout)
 		if e := f.(raft.Future); e.Error() != nil {
 			if e.Error() == raft.ErrNotLeader {
 				return nil, ErrNotLeader
@@ -496,11 +551,11 @@ func (s *Store) Query(queries []string, timings, tx bool, lvl ConsistencyLevel) 
 		return r.rows, r.error
 	}
 
-	if lvl == Weak && s.raft.State() != raft.Leader {
+	if qr.Lvl == Weak && s.raft.State() != raft.Leader {
 		return nil, ErrNotLeader
 	}
 
-	r, err := s.db.Query(queries, tx, timings)
+	r, err := s.db.Query(qr.Queries, qr.Tx, qr.Timings)
 	return r, err
 }
 
@@ -515,27 +570,30 @@ func (s *Store) UpdateAPIPeers(peers map[string]string) error {
 		return err
 	}
 
-	f := s.raft.Apply(b, raftTimeout)
-	if e := f.(raft.Future); e.Error() != nil {
-		return e.Error()
-	}
-	return nil
+	f := s.raft.Apply(b, s.ApplyTimeout)
+	return f.Error()
 }
 
 // Join joins a node, located at addr, to this store. The node must be ready to
 // respond to Raft communications at that address.
 func (s *Store) Join(addr string) error {
 	s.logger.Printf("received request to join node at %s", addr)
+	if s.raft.State() != raft.Leader {
+		return ErrNotLeader
+	}
 
 	f := s.raft.AddPeer(addr)
-	if f.Error() != nil {
-		return f.Error()
+	if e := f.(raft.Future); e.Error() != nil {
+		if e.Error() == raft.ErrNotLeader {
+			return ErrNotLeader
+		}
+		e.Error()
 	}
 	s.logger.Printf("node at %s joined successfully", addr)
 	return nil
 }
 
-// Remove removes a node from the store, specifed by addr.
+// Remove removes a node from the store, specified by addr.
 func (s *Store) Remove(addr string) error {
 	s.logger.Printf("received request to remove node %s", addr)
 
@@ -545,6 +603,42 @@ func (s *Store) Remove(addr string) error {
 	}
 	s.logger.Printf("node %s removed successfully", addr)
 	return nil
+}
+
+// open opens the the in-memory or file-based database.
+func (s *Store) open() (*sql.DB, error) {
+	var db *sql.DB
+	var err error
+	if !s.dbConf.Memory {
+		// as it will be rebuilt from (possibly) a snapshot and committed log entries.
+		if err := os.Remove(s.dbPath); err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+		db, err = sql.OpenWithDSN(s.dbPath, s.dbConf.DSN)
+		if err != nil {
+			return nil, err
+		}
+		s.logger.Println("SQLite database opened at", s.dbPath)
+	} else {
+		db, err = sql.OpenInMemoryWithDSN(s.dbConf.DSN)
+		if err != nil {
+			return nil, err
+		}
+		s.logger.Println("SQLite in-memory database opened")
+	}
+	return db, nil
+}
+
+// raftConfig returns a new Raft config for the store.
+func (s *Store) raftConfig() *raft.Config {
+	config := raft.DefaultConfig()
+	if s.SnapshotThreshold != 0 {
+		config.SnapshotThreshold = s.SnapshotThreshold
+	}
+	if s.HeartbeatTimeout != 0 {
+		config.HeartbeatTimeout = s.HeartbeatTimeout
+	}
+	return config
 }
 
 type fsmExecuteResponse struct {
@@ -598,13 +692,19 @@ func (s *Store) Apply(l *raft.Log) interface{} {
 	}
 }
 
-// Snapshot returns a snapshot of the database. The caller must ensure that
-// no transaction is taking place during this call. Hashsicorp Raft guarantees
-// that this function will not be called concurrently with Apply.
+// Database returns a copy of the underlying database. The caller should
+// ensure that no transaction is taking place during this call, or an error may
+// be returned. If leader is true, this operation is performed with a read
+// consistency level equivalent to "weak". Otherwise no guarantees are made
+// about the read consistency level.
 //
 // http://sqlite.org/howtocorrupt.html states it is safe to do this
 // as long as no transaction is in progress.
-func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
+func (s *Store) Database(leader bool) ([]byte, error) {
+	if leader && s.raft.State() != raft.Leader {
+		return nil, ErrNotLeader
+	}
+
 	// Ensure only one snapshot can take place at once, and block all queries.
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -620,16 +720,27 @@ func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
 		return nil, err
 	}
 
+	return ioutil.ReadFile(f.Name())
+}
+
+// Snapshot returns a snapshot of the database. The caller must ensure that
+// no transaction is taking place during this call. Hashicorp Raft guarantees
+// that this function will not be called concurrently with Apply.
+//
+// http://sqlite.org/howtocorrupt.html states it is safe to do this
+// as long as no transaction is in progress.
+func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
 	fsm := &fsmSnapshot{}
-	fsm.database, err = ioutil.ReadFile(f.Name())
+	var err error
+	fsm.database, err = s.Database(false)
 	if err != nil {
-		log.Printf("Failed to read database for snapshot: %s", err.Error())
+		s.logger.Printf("failed to read database for snapshot: %s", err.Error())
 		return nil, err
 	}
 
 	fsm.meta, err = json.Marshal(s.meta)
 	if err != nil {
-		log.Printf("Failed to encode meta for snapshot: %s", err.Error())
+		s.logger.Printf("failed to encode meta for snapshot: %s", err.Error())
 		return nil, err
 	}
 
@@ -701,6 +812,16 @@ func (s *Store) Restore(rc io.ReadCloser) error {
 	}()
 }
 
+// RegisterObserver registers an observer of Raft events
+func (s *Store) RegisterObserver(o *raft.Observer) {
+	s.raft.RegisterObserver(o)
+}
+
+// DeregisterObserver deregisters an observer of Raft events
+func (s *Store) DeregisterObserver(o *raft.Observer) {
+	s.raft.DeregisterObserver(o)
+}
+
 type fsmSnapshot struct {
 	database []byte
 	meta     []byte
@@ -749,22 +870,10 @@ func (f *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 // Release is a no-op.
 func (f *fsmSnapshot) Release() {}
 
-// readPeersJSON reads the peers from the path.
-func readPeersJSON(path string) ([]string, error) {
-	b, err := ioutil.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, err
+// enabledFromBool converts bool to "enabled" or "disabled".
+func enabledFromBool(b bool) string {
+	if b {
+		return "enabled"
 	}
-
-	if len(b) == 0 {
-		return nil, nil
-	}
-
-	var peers []string
-	dec := json.NewDecoder(bytes.NewReader(b))
-	if err := dec.Decode(&peers); err != nil {
-		return nil, err
-	}
-
-	return peers, nil
+	return "disabled"
 }

@@ -25,7 +25,7 @@ type Node struct {
 	Service  *httpd.Service
 }
 
-// SameAs returns true if this node is the same as o node.
+// SameAs returns true if this node is the same as node o.
 func (n *Node) SameAs(o *Node) bool {
 	return n.RaftAddr == o.RaftAddr
 }
@@ -73,15 +73,18 @@ func (n *Node) Query(stmt string) (string, error) {
 	return string(body), nil
 }
 
+// QueryMulti runs multiple queries against the node.
+func (n *Node) QueryMulti(stmts []string) (string, error) {
+	j, err := json.Marshal(stmts)
+	if err != nil {
+		return "", err
+	}
+	return n.postQuery(string(j))
+}
+
 // Join instructs this node to join the leader.
 func (n *Node) Join(leader *Node) error {
-	b, err := json.Marshal(map[string]string{"addr": n.RaftAddr})
-	if err != nil {
-		return err
-	}
-
-	// Attempt to join leader
-	resp, err := http.Post("http://"+leader.APIAddr+"/join", "application-type/json", bytes.NewReader(b))
+	resp, err := DoJoinRequest(leader.APIAddr, n.RaftAddr)
 	if err != nil {
 		return err
 	}
@@ -90,6 +93,44 @@ func (n *Node) Join(leader *Node) error {
 	}
 	defer resp.Body.Close()
 	return nil
+}
+
+// Status returns the status and diagnostic output for node.
+func (n *Node) Status() (string, error) {
+	v, _ := url.Parse("http://" + n.APIAddr + "/status")
+
+	resp, err := http.Get(v.String())
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("status endpoint returned: %s", resp.Status)
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+// Expvar returns the expvar output for node.
+func (n *Node) Expvar() (string, error) {
+	v, _ := url.Parse("http://" + n.APIAddr + "/debug/vars")
+
+	resp, err := http.Get(v.String())
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("expvar endpoint returned: %s", resp.Status)
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
 }
 
 // ConfirmRedirect confirms that the node responds with a redirect to the given host.
@@ -114,6 +155,19 @@ func (n *Node) ConfirmRedirect(host string) bool {
 
 func (n *Node) postExecute(stmt string) (string, error) {
 	resp, err := http.Post("http://"+n.APIAddr+"/db/execute", "application/json", strings.NewReader(stmt))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+func (n *Node) postQuery(stmt string) (string, error) {
+	resp, err := http.Post("http://"+n.APIAddr+"/db/query", "application/json", strings.NewReader(stmt))
 	if err != nil {
 		return "", err
 	}
@@ -160,7 +214,7 @@ func (c Cluster) WaitForNewLeader(old *Node) (*Node, error) {
 	}
 }
 
-// Followers returns the slide of nodes in the cluster that are followers.
+// Followers returns the slice of nodes in the cluster that are followers.
 func (c Cluster) Followers() ([]*Node, error) {
 	n, err := c[0].WaitForLeader()
 	if err != nil {
@@ -227,13 +281,32 @@ func Remove(n *Node, addr string) error {
 	return nil
 }
 
+// DoJoinRequest sends a join request to nodeAddr, for raftAddr.
+func DoJoinRequest(nodeAddr, raftAddr string) (*http.Response, error) {
+	b, err := json.Marshal(map[string]string{"addr": raftAddr})
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.Post("http://"+nodeAddr+"/join", "application-type/json", bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
 func mustNewNode(enableSingle bool) *Node {
 	node := &Node{
 		Dir: mustTempDir(),
 	}
 
 	dbConf := store.NewDBConfig("", false)
-	node.Store = store.New(dbConf, node.Dir, mustMockTransport("localhost:0"))
+	node.Store = store.New(&store.StoreConfig{
+		DBConf: dbConf,
+		Dir:    node.Dir,
+		Tn:     mustMockTransport("localhost:0"),
+	})
 	if err := node.Store.Open(enableSingle); err != nil {
 		node.Deprovision()
 		panic(fmt.Sprintf("failed to open store: %s", err.Error()))
@@ -241,6 +314,7 @@ func mustNewNode(enableSingle bool) *Node {
 	node.RaftAddr = node.Store.Addr().String()
 
 	node.Service = httpd.New("localhost:0", node.Store, nil)
+	node.Service.Expvar = true
 	if err := node.Service.Start(); err != nil {
 		node.Deprovision()
 		panic(fmt.Sprintf("failed to start HTTP server: %s", err.Error()))
@@ -288,4 +362,9 @@ func mustTempDir() string {
 		panic("failed to create temp dir")
 	}
 	return path
+}
+
+func isJSON(s string) bool {
+	var js map[string]interface{}
+	return json.Unmarshal([]byte(s), &js) == nil
 }

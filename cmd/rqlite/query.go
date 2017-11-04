@@ -34,6 +34,11 @@ func (r *Rows) Get(i, j int) string {
 		}
 		return r.Columns[j]
 	}
+
+	if r.Values == nil {
+		return "NULL"
+	}
+
 	if i-1 >= len(r.Values) {
 		return "NULL"
 	}
@@ -47,7 +52,7 @@ func (r *Rows) validate() error {
 	if r.Error != "" {
 		return fmt.Errorf(r.Error)
 	}
-	if r.Columns == nil || r.Types == nil || r.Values == nil {
+	if r.Columns == nil || r.Types == nil {
 		return fmt.Errorf("unexpected result")
 	}
 	return nil
@@ -75,9 +80,9 @@ type queryResponse struct {
 }
 
 func query(ctx *cli.Context, cmd, line string, argv *argT) error {
-	urlStr := fmt.Sprintf("%s://%s:%d/db/query?timings", argv.Protocol, argv.Host, argv.Port)
+	urlStr := fmt.Sprintf("%s://%s:%d%sdb/query", argv.Protocol, argv.Host, argv.Port, argv.Prefix)
 	ret := &queryResponse{}
-	if err := sendRequest(ctx, urlStr, line, ret); err != nil {
+	if err := sendRequest(ctx, urlStr, line, argv, ret); err != nil {
 		return err
 	}
 	if ret.Error != "" {
